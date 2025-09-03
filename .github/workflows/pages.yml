@@ -1,0 +1,99 @@
+name: Deploy static site to Pages
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show repo tree (top 3 levels)
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type f -name "package.json" -print
+          find . -maxdepth 2 -type f -name "*.zip" -print
+
+      # Locate package.json; if missing, unzip the first .zip and search inside it
+      - name: Auto-detect app folder (package.json or zip)
+        id: pkg
+        run: |
+          set -e
+          LOC=$(find . -maxdepth 4 -type f -name package.json | head -n1 || true)
+          if [ -z "$LOC" ]; then
+            ZIP=$(find . -maxdepth 2 -type f -name "*.zip" | head -n1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "No package.json and no .zip found in repo root. Upload your project or a zip."; exit 1
+            fi
+            echo "Unzipping $ZIP ..."
+            mkdir -p unpacked
+            unzip -q "$ZIP" -d unpacked
+            LOC=$(find unpacked -maxdepth 6 -type f -name package.json | head -n1 || true)
+            if [ -z "$LOC" ]; then
+              echo "Unzipped but no package.json found inside the zip."; exit 1
+            fi
+          fi
+          DIR=$(dirname "$LOC")
+          echo "dir=$DIR" >> $GITHUB_OUTPUT
+          echo "Using dir: $DIR"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies (npm / yarn / pnpm)
+        working-directory: ${{ steps.pkg.outputs.dir }}
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile || yarn install
+          else
+            npm ci || npm install
+          fi
+
+      - name: Build
+        working-directory: ${{ steps.pkg.outputs.dir }}
+        run: |
+          echo "Build script in package.json:"
+          node -e "console.log(require('./package.json').scripts?.build || '<<no build script>>')"
+          npm run build || (echo "npm run build failed; ensure a 'build' script exists in package.json" && exit 1)
+
+      - name: Find publish dir (dist/build/out)
+        id: finddir
+        working-directory: ${{ steps.pkg.outputs.dir }}
+        run: |
+          for d in dist build out; do
+            if [ -d "$d" ]; then echo "dir=$d" >> $GITHUB_OUTPUT; exit 0; fi
+          done
+          echo "No dist/build/out found after build"; ls -la; exit 1
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.pkg.outputs.dir }}/${{ steps.finddir.outputs.dir }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
